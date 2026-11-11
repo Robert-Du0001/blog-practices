@@ -8,10 +8,10 @@
 
 ## 收录的实战
 
-| 文件夹 | 名称 | 技术栈 | 说明 |
-| --- | --- | --- | --- |
-| [`go-resume-web-practice/`](./go-resume-web-practice) | 个人简历网页服务实战 | Go 标准库（`net/http`、`embed`） | 用 Go 把一份 HTML + CSS 简历做成可被局域网访问的网页服务，共三篇 |
-| _（待加入）_ | 更多实战陆续更新 | — | 每篇新实战都会以独立文件夹形式加进来 |
+| 文件夹 | 名称 | 说明 |
+| --- | --- | --- |
+| [`go-resume-web-practice/`](./go-resume-web-practice) | 个人简历网页服务实战 | 用 Go 把一份 HTML + CSS 简历做成可被局域网访问的网页服务，共三篇 |
+| [`chunk-downloader/`](./chunk-downloader) | 手写分块下载器 | 开发一个文件分块下载器，以提高下载大文件的速度 |
 
 ---
 
