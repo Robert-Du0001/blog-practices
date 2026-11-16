@@ -8,13 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const (
-	size = 10<<20 + 123 // 定义一个 10 MiB + 123 B 的测试文件
+	size = 10<<20 + 123 // 故意不整除，好看清最后一块的兜底
 	n    = 8
 )
 
@@ -51,7 +51,7 @@ type Chunk struct {
 func split(size int64, n int) []Chunk {
 	per := size / int64(n)
 	cs := make([]Chunk, 0, n)
-	for i := range n {
+	for i := 0; i < n; i++ {
 		s := int64(i) * per
 		e := s + per - 1
 		if i == n-1 {
@@ -62,68 +62,68 @@ func split(size int64, n int) []Chunk {
 	return cs
 }
 
-type Result struct {
-	Index int
-	Data  []byte
-	Err   error
-}
+// download 把每块直接写进目标文件的对应区间，不在内存里攒数据。
+func download(url, dst string, cs []Chunk) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
-// download 给每块起一个 goroutine，结果按 Index 归位。
-func download(url string, cs []Chunk) ([][]byte, error) {
-	chunks := make([][]byte, len(cs))
-	ch := make(chan Result, len(cs)) // 缓冲开成块数：中途 return 也不会有协程卡在发送上
+	total := cs[len(cs)-1].End + 1
+	if err := f.Truncate(total); err != nil {
+		return err
+	}
+	fmt.Printf("预分配: %s  %d 字节（没写到的地方是零值）\n", dst, total)
+
 	var wg sync.WaitGroup
-	// atomic.Int32 是标准库的原子计数器，多个人同时加也不会加错，这里只用来给「第几个完成」编号
-	var seq atomic.Int32
+	errs := make(chan error, len(cs)) // 只传错误，数据已经落盘
 
 	for _, c := range cs {
 		wg.Add(1)
 		go func(c Chunk) { // 显式传参，别直接捕获循环变量
 			defer wg.Done()
-
-			// 仅为了演示乱序：块号小的晚一点发请求。
-			// 真实下载不需要，删掉这行程序照常工作。
-			time.Sleep(time.Duration(len(cs)-1-c.Index) * 3 * time.Millisecond)
-
 			req, _ := http.NewRequest(http.MethodGet, url, nil)
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", c.Start, c.End))
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
-				ch <- Result{Index: c.Index, Err: err}
+				errs <- err
 				return
 			}
 			defer resp.Body.Close() // 漏了会耗尽连接池
-
 			// 第一篇的两个坑，一个都不能省
 			if resp.StatusCode != http.StatusPartialContent {
-				ch <- Result{Index: c.Index,
-					Err: fmt.Errorf("块 %d：期望 206，实际 %d", c.Index, resp.StatusCode)}
+				errs <- fmt.Errorf("块 %d：期望 206，实际 %d", c.Index, resp.StatusCode)
 				return
 			}
-			b, err := io.ReadAll(resp.Body)
-			if err == nil && int64(len(b)) != c.End-c.Start+1 {
-				err = fmt.Errorf("块 %d：长度 %d，期望 %d", c.Index, len(b), c.End-c.Start+1)
+			// 每块自带 offset：OffsetWriter 内部走 f.WriteAt，不动共享文件偏移
+			w := io.NewOffsetWriter(f, c.Start)
+			written, err := io.Copy(w, resp.Body)
+			if err != nil {
+				errs <- err
+				return
 			}
-			if err == nil {
-				fmt.Printf("  第 %d 个完成：块 %d（%d 字节）\n", seq.Add(1), c.Index, len(b))
+			if written != c.End-c.Start+1 {
+				errs <- fmt.Errorf("块 %d：写入 %d 字节，期望 %d", c.Index, written, c.End-c.Start+1)
+				return
 			}
-			ch <- Result{Index: c.Index, Data: b, Err: err}
+			fmt.Printf("  块 %d → offset=%-8d %d 字节\n", c.Index, c.Start, written)
 		}(c)
 	}
 
-	go func() { wg.Wait(); close(ch) }() // close 必须在所有 goroutine 都发完之后
-
-	for r := range ch {
-		if r.Err != nil {
-			return nil, r.Err
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		if e != nil {
+			return e
 		}
-		chunks[r.Index] = r.Data // 下标即位置，与到达顺序无关
 	}
-	return chunks, nil
+	return f.Sync() // 把缓冲刷到磁盘
 }
 
 func main() {
-	want := sha256.Sum256(data) // data 就是靶场共用的那份测试文件
+	const dst = "big.bin"
+	want := sha256.Sum256(data)
 	srv := newServer()
 	defer srv.Close()
 	url := srv.URL + "/big.bin"
@@ -138,31 +138,31 @@ func main() {
 		panic("服务端不支持 Range，应降级为单连接下载")
 	}
 	total := head.ContentLength
-
-	// 切块
 	cs := split(total, n)
-	fmt.Printf("文件 %d 字节，切成 %d 块（每块 %d 字节）\n", total, len(cs), cs[0].End-cs[0].Start+1)
-	for _, c := range cs {
-		fmt.Printf("  块 %d  Range: bytes=%d-%d  %d 字节\n",
-			c.Index, c.Start, c.End, c.End-c.Start+1)
+	fmt.Printf("文件 %d 字节，切成 %d 块\n", total, len(cs))
+
+	// 并发下载，各块直接落盘
+	if err := download(url, dst, cs); err != nil {
+		panic(err)
 	}
 
-	// 并发下载 + 按 Index 归位
-	fmt.Println("并发下载中：")
-	chunks, err := download(url, cs)
+	// 重新打开文件算 SHA256，和靶场那份内容比对
+	f, err := os.Open(dst)
+	if err != nil {
+		panic(err)
+	}
+	h := sha256.New()
+	written, err := io.Copy(h, f)
+	f.Close()
 	if err != nil {
 		panic(err)
 	}
 
-	// 按序拼接 + 完整性校验
-	var merged bytes.Buffer
-	for _, p := range chunks {
-		merged.Write(p)
-	}
-	got := sha256.Sum256(merged.Bytes())
+	got := hex.EncodeToString(h.Sum(nil))
 	fmt.Println("--- 结果 ---")
-	fmt.Println("拼接字节数  :", merged.Len())
+	fmt.Println("落盘文件大小:", written)
 	fmt.Println("原文件 SHA256:", hex.EncodeToString(want[:]))
-	fmt.Println("拼接 SHA256:", hex.EncodeToString(got[:]))
-	fmt.Println("内容一致    :", got == want)
+	fmt.Println("落盘 SHA256 :", got)
+	fmt.Println("内容一致    :", got == hex.EncodeToString(want[:]))
+	fmt.Println("文件留在当前目录:", dst, "（看完可删）")
 }
